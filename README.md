@@ -38,8 +38,8 @@ If power is cut mid-flash, the flag is already cleared so the next boot skips th
 ## CAN protocol
 
 **Bus:** CAN1, 250 kbps  
-**Host → VCU:** ID `0x7E0`  
-**VCU → Host:** ID `0x7E1`
+**Host → STM32:** ID `0x7E0`  
+**STM32 → Host:** ID `0x7E1`
 
 | Command | Byte 0 | Bytes 1–4 | Description |
 |---------|--------|-----------|-------------|
