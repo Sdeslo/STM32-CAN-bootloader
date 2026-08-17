@@ -1,6 +1,6 @@
 # STM32 CAN Bootloader — STM32F446RE
 
-Custom CAN bootloader for the VCU (STM32F446RE). Allows flashing the application firmware over CAN without touching the board.
+Custom CAN bootloader for a STM32F446RE. Allows flashing the application firmware over CAN without touching the board.
 
 ---
 
