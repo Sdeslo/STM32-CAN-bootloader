@@ -15,8 +15,12 @@ import time
 import zlib
 import can
 
-BL_RX_ID   = 0x7E0   # host → VCU
-BL_TX_ID   = 0x7E1   # VCU  → host
+BL_RX_ID   = 0x7E0   # host → VCU (bootloader commands)
+BL_TX_ID   = 0x7E1   # VCU  → host (bootloader responses)
+
+# CAN frame the app listens for to trigger reset into bootloader
+APP_RESET_ID   = 0x7DF
+APP_RESET_DATA = bytes([0xDE, 0xAD])
 
 CMD_PING   = 0x01
 CMD_START  = 0x02
@@ -54,11 +58,29 @@ def recv_ack(bus: can.Bus, cmd_name: str) -> None:
     raise TimeoutError(f"{cmd_name} → no response after {TIMEOUT_S} s")
 
 
-def ping(bus: can.Bus) -> None:
-    print("PING ...", end=" ", flush=True)
-    send(bus, bytes([CMD_PING]))
-    recv_ack(bus, "PING")
-    print("OK")
+def trigger_app_reset(bus: can.Bus) -> None:
+    """Tell the running app to set the RAM flag and reset into the bootloader."""
+    msg = can.Message(arbitration_id=APP_RESET_ID,
+                      data=APP_RESET_DATA,
+                      is_extended_id=False)
+    bus.send(msg, timeout=1.0)
+    print("Reset request sent to app — waiting for bootloader ...")
+
+
+def ping_until_alive(bus: can.Bus, retries: int = 30) -> None:
+    """Send PING repeatedly until the bootloader ACKs (gives MCU time to reset)."""
+    print("PING", end="", flush=True)
+    for _ in range(retries):
+        try:
+            send(bus, bytes([CMD_PING]))
+            msg = bus.recv(timeout=0.1)
+            if msg and msg.arbitration_id == BL_TX_ID and msg.data[0] == RESP_ACK:
+                print(" OK")
+                return
+        except Exception:
+            pass
+        print(".", end="", flush=True)
+    raise TimeoutError("Bootloader did not respond — is the VCU connected?")
 
 
 def flash(bus: can.Bus, firmware: bytes) -> None:
@@ -122,8 +144,9 @@ def main() -> None:
     with can.Bus(interface=args.interface,
                  channel=args.channel,
                  bitrate=args.bitrate) as bus:
-        ping(bus)
-        flash(bus, firmware)
+        trigger_app_reset(bus)   # ask running app to reset into bootloader
+        ping_until_alive(bus)    # wait for bootloader to come up
+        flash(bus, firmware)     # flash + jump back to app
 
 
 if __name__ == "__main__":

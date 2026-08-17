@@ -1,7 +1,14 @@
 #include "bootloader.h"
 #include <string.h>
 
-/* ── Helpers ─────────────────────────────────────────────────────────────────*/
+
+static int bl_flag_is_set(void)
+{
+    uint32_t flag = *(volatile uint32_t *)BL_FLAG_ADDR;
+    *(volatile uint32_t *)BL_FLAG_ADDR = 0;
+    return (flag == BL_FLAG_MAGIC);
+}
+
 
 static CAN_HandleTypeDef *s_hcan;
 static CAN_TxHeaderTypeDef s_tx_hdr = {
@@ -27,7 +34,6 @@ static void send_nack(uint8_t err)
     HAL_CAN_AddTxMessage(s_hcan, &s_tx_hdr, data, &mailbox);
 }
 
-/* ── Flash helpers ───────────────────────────────────────────────────────────*/
 
 /* Returns FLASH_SECTOR_x for an address inside the app region (sectors 1-6). */
 static uint32_t addr_to_sector(uint32_t addr)
@@ -44,9 +50,9 @@ static HAL_StatusTypeDef erase_app_sectors(void)
 {
     FLASH_EraseInitTypeDef erase = {
         .TypeErase    = FLASH_TYPEERASE_SECTORS,
-        .VoltageRange = FLASH_VOLTAGE_RANGE_3,   /* 2.7–3.6 V */
+        .VoltageRange = FLASH_VOLTAGE_RANGE_3,
         .Sector       = FLASH_SECTOR_1,
-        .NbSectors    = 6,                       /* sectors 1-6 */
+        .NbSectors    = FLASH_NB_SECTORS,
     };
     uint32_t bad_sector;
     HAL_FLASH_Unlock();
@@ -61,8 +67,7 @@ static HAL_StatusTypeDef flash_write_word(uint32_t addr, uint32_t word)
     return HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, word);
 }
 
-/* ── Simple CRC-32 (no hardware peripheral needed in bootloader) ─────────────*/
-
+/* CRC-32 (no hardware peripheral needed in bootloader) */
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
     static const uint32_t table[16] = {
@@ -80,8 +85,7 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
     return ~crc;
 }
 
-/* ── Jump to application ─────────────────────────────────────────────────────*/
-
+/* Jump to application */
 static int app_is_valid(void)
 {
     /* Stack pointer must point inside RAM */
@@ -91,32 +95,25 @@ static int app_is_valid(void)
 
 static void jump_to_app(void)
 {
-    /* Disable all interrupts and systick */
     __disable_irq();
     SysTick->CTRL = 0;
 
-    /* Clear pending IRQs */
     for (int i = 0; i < 8; i++) {
         NVIC->ICER[i] = 0xFFFFFFFFU;
         NVIC->ICPR[i] = 0xFFFFFFFFU;
     }
 
-    /* Relocate vector table */
     SCB->VTOR = APP_START_ADDR;
 
-    /* Load app stack pointer and reset handler */
     uint32_t sp  = *(volatile uint32_t *)(APP_START_ADDR);
     uint32_t pc  = *(volatile uint32_t *)(APP_START_ADDR + 4U);
 
-    /* Set stack pointer and branch to reset handler via function pointer */
     __set_MSP(sp);
     void (*app_reset)(void) = (void (*)(void))pc;
     app_reset();
-    /* never returns */
 }
 
-/* ── CAN filter: accept only BL_RX_ID ───────────────────────────────────────*/
-
+/* CAN filter: accept only BL_RX_ID */
 static void setup_can_filter(void)
 {
     CAN_FilterTypeDef f = {
@@ -134,7 +131,7 @@ static void setup_can_filter(void)
     HAL_CAN_ConfigFilter(s_hcan, &f);
 }
 
-/* ── Main bootloader entry point ─────────────────────────────────────────────*/
+/* Main bootloader entry point */
 
 void BL_Run(CAN_HandleTypeDef *hcan)
 {
@@ -150,24 +147,25 @@ void BL_Run(CAN_HandleTypeDef *hcan)
     int      flash_active = 0;
     int      flash_unlocked = 0;
 
-    uint32_t deadline = HAL_GetTick() + BL_WAIT_MS;
+    /* If the app set the RAM flag, wait indefinitely for flash.
+     * Otherwise use the short timeout and jump to app immediately after. */
+    int flash_requested = bl_flag_is_set();
+    uint32_t deadline = flash_requested ? 0xFFFFFFFFU
+                                        : HAL_GetTick() + BL_WAIT_MS;
 
     CAN_RxHeaderTypeDef rx_hdr;
     uint8_t rx_data[8];
 
     while (1) {
-        /* ── Check for timeout → jump if no flashing in progress ──────────── */
         if (!flash_active && HAL_GetTick() > deadline) {
             if (app_is_valid()) {
                 if (flash_unlocked) HAL_FLASH_Lock();
                 HAL_CAN_Stop(hcan);
                 jump_to_app();
             }
-            /* No valid app — stay in bootloader waiting for a flash */
             deadline = HAL_GetTick() + BL_WAIT_MS;
         }
 
-        /* ── Poll for CAN frame ────────────────────────────────────────────── */
         if (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) == 0)
             continue;
 
@@ -178,12 +176,10 @@ void BL_Run(CAN_HandleTypeDef *hcan)
 
         switch (cmd) {
 
-        /* ── PING ────────────────────────────────────────────────────────── */
         case BL_CMD_PING:
             send_ack();
             break;
 
-        /* ── START: erase app, prepare for data ──────────────────────────── */
         case BL_CMD_START:
             if (rx_hdr.DLC < 5) { send_nack(BL_ERR_NOSTART); break; }
             total_size = (uint32_t)rx_data[1]
@@ -208,7 +204,6 @@ void BL_Run(CAN_HandleTypeDef *hcan)
             send_ack();
             break;
 
-        /* ── DATA: write 4 bytes to flash ────────────────────────────────── */
         case BL_CMD_DATA:
             if (!flash_active) { send_nack(BL_ERR_NOSTART); break; }
             if (rx_hdr.DLC < 5) { send_nack(BL_ERR_WRITE); break; }
@@ -230,7 +225,6 @@ void BL_Run(CAN_HandleTypeDef *hcan)
             send_ack();
             break;
 
-        /* ── CRC: verify written flash ───────────────────────────────────── */
         case BL_CMD_CRC:
             if (!flash_active) { send_nack(BL_ERR_NOSTART); break; }
             if (rx_hdr.DLC < 5) { send_nack(BL_ERR_CRC); break; }
@@ -252,7 +246,6 @@ void BL_Run(CAN_HandleTypeDef *hcan)
             send_ack();
             break;
 
-        /* ── JUMP: reset into app ────────────────────────────────────────── */
         case BL_CMD_JUMP:
             if (!app_is_valid()) { send_nack(BL_ERR_NOJUMP); break; }
             send_ack();
