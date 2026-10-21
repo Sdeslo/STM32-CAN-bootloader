@@ -27,10 +27,22 @@ CMD_START  = 0x02
 CMD_DATA   = 0x03
 CMD_CRC    = 0x04
 CMD_JUMP   = 0x05
-RESP_ACK   = 0x06
-RESP_NACK  = 0x07
+RESP_ACK     = 0x06
+RESP_NACK    = 0x07
+RESP_PENDING = 0x08
 
-TIMEOUT_S  = 2.0
+ERR_SEQ    = 0x07
+
+TIMEOUT_S        = 2.0
+ERASE_TIMEOUT_S  = 5.0   # per sector
+RETRIES          = 5
+
+
+class Nack(Exception):
+    def __init__(self, cmd_name: str, err: int, data: bytes):
+        super().__init__(f"{cmd_name} → NACK, error code 0x{err:02X}")
+        self.err = err
+        self.data = data
 
 
 def crc32(data: bytes) -> int:
@@ -42,20 +54,26 @@ def send(bus: can.Bus, data: bytes) -> None:
     bus.send(msg, timeout=1.0)
 
 
-def recv_ack(bus: can.Bus, cmd_name: str) -> None:
-    deadline = time.time() + TIMEOUT_S
+def recv_ack(bus: can.Bus, cmd: int, cmd_name: str,
+             timeout: float = TIMEOUT_S, idx: int | None = None) -> None:
+    deadline = time.time() + timeout
     while time.time() < deadline:
         msg = bus.recv(timeout=0.1)
-        if msg is None:
+        if msg is None or msg.arbitration_id != BL_TX_ID or len(msg.data) < 2:
             continue
-        if msg.arbitration_id != BL_TX_ID:
+        kind, rcmd = msg.data[0], msg.data[1]
+        if rcmd != cmd:
             continue
-        if msg.data[0] == RESP_ACK:
-            return
-        if msg.data[0] == RESP_NACK:
-            err = msg.data[1] if len(msg.data) > 1 else 0
-            raise RuntimeError(f"{cmd_name} → NACK, error code 0x{err:02X}")
-    raise TimeoutError(f"{cmd_name} → no response after {TIMEOUT_S} s")
+        if kind == RESP_PENDING:
+            deadline = time.time() + timeout
+        elif kind == RESP_ACK:
+            if idx is None or (len(msg.data) >= 5 and
+                               int.from_bytes(msg.data[2:5], "little") == idx):
+                return
+        elif kind == RESP_NACK:
+            err = msg.data[2] if len(msg.data) > 2 else 0
+            raise Nack(cmd_name, err, bytes(msg.data))
+    raise TimeoutError(f"{cmd_name} → no response after {timeout} s")
 
 
 def trigger_app_reset(bus: can.Bus) -> None:
@@ -73,53 +91,70 @@ def ping_until_alive(bus: can.Bus, retries: int = 30) -> None:
     for _ in range(retries):
         try:
             send(bus, bytes([CMD_PING]))
-            msg = bus.recv(timeout=0.1)
-            if msg and msg.arbitration_id == BL_TX_ID and msg.data[0] == RESP_ACK:
-                print(" OK")
-                return
+            recv_ack(bus, CMD_PING, "PING", timeout=0.1)
+            print(" OK")
+            return
         except Exception:
             pass
         print(".", end="", flush=True)
     raise TimeoutError("Bootloader did not respond — is the VCU connected?")
 
 
+def send_with_retry(bus: can.Bus, data: bytes, cmd: int, cmd_name: str,
+                    idx: int | None = None) -> None:
+    for attempt in range(RETRIES):
+        send(bus, data)
+        try:
+            recv_ack(bus, cmd, cmd_name, idx=idx)
+            return
+        except TimeoutError:
+            if attempt == RETRIES - 1:
+                raise
+
+
 def flash(bus: can.Bus, firmware: bytes) -> None:
     size = len(firmware)
 
-    # Pad to 4-byte boundary
     if size % 4:
         firmware += b"\xFF" * (4 - size % 4)
         size = len(firmware)
 
     expected_crc = crc32(firmware)
 
-    # START
     print(f"START  ({size} bytes) ...", end=" ", flush=True)
     send(bus, bytes([CMD_START]) + struct.pack("<I", size))
-    recv_ack(bus, "START")
+    recv_ack(bus, CMD_START, "START", timeout=ERASE_TIMEOUT_S)
     print("OK (sectors erased)")
 
-    # DATA — 4 bytes per frame
     total_frames = size // 4
-    for i in range(total_frames):
+    i = 0
+    while i < total_frames:
         word = firmware[i*4:(i+1)*4]
-        send(bus, bytes([CMD_DATA]) + word)
-        recv_ack(bus, f"DATA[{i}]")
-        if (i + 1) % 100 == 0 or (i + 1) == total_frames:
-            pct = (i + 1) / total_frames * 100
-            print(f"\r  {pct:5.1f}%  {(i+1)*4}/{size} bytes", end="", flush=True)
+        frame = bytes([CMD_DATA]) + i.to_bytes(3, "little") + word
+        try:
+            send_with_retry(bus, frame, CMD_DATA, f"DATA[{i}]", idx=i)
+        except Nack as e:
+            if e.err != ERR_SEQ or len(e.data) < 6:
+                raise
+            expected = int.from_bytes(e.data[3:6], "little")
+            if expected > total_frames:
+                raise
+            i = expected
+            continue
+        i += 1
+        if i % 100 == 0 or i == total_frames:
+            pct = i / total_frames * 100
+            print(f"\r  {pct:5.1f}%  {i*4}/{size} bytes", end="", flush=True)
     print()
 
-    # CRC
     print(f"CRC    (0x{expected_crc:08X}) ...", end=" ", flush=True)
-    send(bus, bytes([CMD_CRC]) + struct.pack("<I", expected_crc))
-    recv_ack(bus, "CRC")
+    send_with_retry(bus, bytes([CMD_CRC]) + struct.pack("<I", expected_crc),
+                    CMD_CRC, "CRC")
     print("OK")
 
-    # JUMP
     print("JUMP   ...", end=" ", flush=True)
     send(bus, bytes([CMD_JUMP]))
-    recv_ack(bus, "JUMP")
+    recv_ack(bus, CMD_JUMP, "JUMP")
     print("OK — VCU is booting the new app")
 
 
@@ -144,9 +179,9 @@ def main() -> None:
     with can.Bus(interface=args.interface,
                  channel=args.channel,
                  bitrate=args.bitrate) as bus:
-        trigger_app_reset(bus)   # ask running app to reset into bootloader
-        ping_until_alive(bus)    # wait for bootloader to come up
-        flash(bus, firmware)     # flash + jump back to app
+        trigger_app_reset(bus)
+        ping_until_alive(bus)
+        flash(bus, firmware)
 
 
 if __name__ == "__main__":

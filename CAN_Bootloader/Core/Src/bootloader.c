@@ -1,5 +1,5 @@
 #include "bootloader.h"
-#include <string.h>
+#include <stddef.h>
 
 
 static int bl_flag_is_set(void)
@@ -18,56 +18,115 @@ static CAN_TxHeaderTypeDef s_tx_hdr = {
     .TransmitGlobalTime = DISABLE,
 };
 
-static void send_ack(void)
+static void send_frame(const uint8_t *data, uint32_t dlc)
 {
-    uint8_t data = BL_RESP_ACK;
     uint32_t mailbox;
-    s_tx_hdr.DLC = 1;
-    HAL_CAN_AddTxMessage(s_hcan, &s_tx_hdr, &data, &mailbox);
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_CAN_GetTxMailboxesFreeLevel(s_hcan) == 0) {
+        if (HAL_GetTick() - t0 > 10U) return;
+    }
+    s_tx_hdr.DLC = dlc;
+    HAL_CAN_AddTxMessage(s_hcan, &s_tx_hdr, (uint8_t *)data, &mailbox);
 }
 
-static void send_nack(uint8_t err)
+static void wait_tx_done(void)
 {
-    uint8_t data[2] = { BL_RESP_NACK, err };
-    uint32_t mailbox;
-    s_tx_hdr.DLC = 2;
-    HAL_CAN_AddTxMessage(s_hcan, &s_tx_hdr, data, &mailbox);
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_CAN_GetTxMailboxesFreeLevel(s_hcan) < 3U) {
+        if (HAL_GetTick() - t0 > 10U) return;
+    }
+}
+
+static void send_ack(uint8_t cmd)
+{
+    uint8_t data[2] = { BL_RESP_ACK, cmd };
+    send_frame(data, 2);
+}
+
+static void send_ack_data(uint32_t idx)
+{
+    uint8_t data[5] = { BL_RESP_ACK, BL_CMD_DATA,
+                        (uint8_t)idx, (uint8_t)(idx >> 8), (uint8_t)(idx >> 16) };
+    send_frame(data, 5);
+}
+
+static void send_nack(uint8_t cmd, uint8_t err)
+{
+    uint8_t data[3] = { BL_RESP_NACK, cmd, err };
+    send_frame(data, 3);
+}
+
+static void send_nack_seq(uint32_t next_idx)
+{
+    uint8_t data[6] = { BL_RESP_NACK, BL_CMD_DATA, BL_ERR_SEQ,
+                        (uint8_t)next_idx, (uint8_t)(next_idx >> 8), (uint8_t)(next_idx >> 16) };
+    send_frame(data, 6);
+}
+
+static void send_pending(uint8_t cmd)
+{
+    uint8_t data[2] = { BL_RESP_PENDING, cmd };
+    send_frame(data, 2);
+}
+
+static uint32_t rd_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+         | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 
-/* Returns FLASH_SECTOR_x for an address inside the app region (sectors 1-6). */
 static uint32_t addr_to_sector(uint32_t addr)
 {
-    if      (addr < 0x08008000U) return FLASH_SECTOR_1;   /* 16 KB */
-    else if (addr < 0x0800C000U) return FLASH_SECTOR_2;   /* 16 KB */
-    else if (addr < 0x08010000U) return FLASH_SECTOR_3;   /* 16 KB */
-    else if (addr < 0x08020000U) return FLASH_SECTOR_4;   /* 64 KB */
-    else if (addr < 0x08040000U) return FLASH_SECTOR_5;   /* 128 KB */
-    else                         return FLASH_SECTOR_6;   /* 128 KB */
+    if      (addr < 0x08008000U) return FLASH_SECTOR_1;
+    else if (addr < 0x0800C000U) return FLASH_SECTOR_2;
+    else if (addr < 0x08010000U) return FLASH_SECTOR_3;
+    else if (addr < 0x08020000U) return FLASH_SECTOR_4;
+    else if (addr < 0x08040000U) return FLASH_SECTOR_5;
+    else                         return FLASH_SECTOR_6;
 }
 
-static HAL_StatusTypeDef erase_app_sectors(void)
+static HAL_StatusTypeDef erase_sector(uint32_t sector)
 {
     FLASH_EraseInitTypeDef erase = {
         .TypeErase    = FLASH_TYPEERASE_SECTORS,
         .VoltageRange = FLASH_VOLTAGE_RANGE_3,
-        .Sector       = FLASH_SECTOR_1,
-        .NbSectors    = FLASH_NB_SECTORS,
+        .Sector       = sector,
+        .NbSectors    = 1,
     };
     uint32_t bad_sector;
-    HAL_FLASH_Unlock();
-    HAL_StatusTypeDef st = HAL_FLASHEx_Erase(&erase, &bad_sector);
-    HAL_FLASH_Lock();
-    return st;
+    return HAL_FLASHEx_Erase(&erase, &bad_sector);
 }
 
-/* Write exactly 4 bytes (one word) to flash. Caller must unlock. */
+/* Trailer sector first, so the current app is invalidated before anything else. */
+static HAL_StatusTypeDef erase_app_sectors(uint32_t size)
+{
+    uint32_t trailer_sector = addr_to_sector(BL_TRAILER_ADDR);
+    uint32_t last_sector    = addr_to_sector(APP_START_ADDR + size - 1U);
+
+    if (erase_sector(trailer_sector) != HAL_OK) return HAL_ERROR;
+    send_pending(BL_CMD_START);
+
+    for (uint32_t s = FLASH_SECTOR_1; s <= last_sector; s++) {
+        if (s == trailer_sector) continue;
+        if (erase_sector(s) != HAL_OK) return HAL_ERROR;
+        send_pending(BL_CMD_START);
+    }
+    return HAL_OK;
+}
+
 static HAL_StatusTypeDef flash_write_word(uint32_t addr, uint32_t word)
 {
     return HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr, word);
 }
 
-/* CRC-32 (no hardware peripheral needed in bootloader) */
+static void flash_flush_dcache(void)
+{
+    __HAL_FLASH_DATA_CACHE_DISABLE();
+    __HAL_FLASH_DATA_CACHE_RESET();
+    __HAL_FLASH_DATA_CACHE_ENABLE();
+}
+
 static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
 {
     static const uint32_t table[16] = {
@@ -85,18 +144,54 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
     return ~crc;
 }
 
-/* Jump to application */
+static uint32_t flash_crc(uint32_t size)
+{
+    return crc32_update(0, (const uint8_t *)APP_START_ADDR, size);
+}
+
+/* Magic word last. */
+static HAL_StatusTypeDef write_trailer(uint32_t size, uint32_t crc)
+{
+    if (flash_write_word(BL_TRAILER_ADDR + offsetof(bl_trailer_t, size), size) != HAL_OK)
+        return HAL_ERROR;
+    if (flash_write_word(BL_TRAILER_ADDR + offsetof(bl_trailer_t, crc), crc) != HAL_OK)
+        return HAL_ERROR;
+    return flash_write_word(BL_TRAILER_ADDR + offsetof(bl_trailer_t, magic), BL_TRAILER_MAGIC);
+}
+
 static int app_is_valid(void)
 {
-    /* Stack pointer must point inside RAM */
+    const volatile bl_trailer_t *t = (const volatile bl_trailer_t *)BL_TRAILER_ADDR;
+    uint32_t size = t->size;
+
+    if (t->magic != BL_TRAILER_MAGIC) return 0;
+    if (size < 8U || size > APP_MAX_SIZE || (size & 3U)) return 0;
+
     uint32_t sp = *(volatile uint32_t *)APP_START_ADDR;
-    return (sp >= 0x20000000U && sp <= 0x20020000U);
+    uint32_t pc = *(volatile uint32_t *)(APP_START_ADDR + 4U);
+    if (sp < 0x20000000U || sp > 0x20020000U || (sp & 3U)) return 0;
+    if (!(pc & 1U) || pc < APP_START_ADDR || pc >= APP_START_ADDR + size) return 0;
+
+    return flash_crc(size) == t->crc;
 }
 
 static void jump_to_app(void)
 {
+    wait_tx_done();
+    HAL_CAN_Stop(s_hcan);
+    HAL_FLASH_Lock();
+
+    /* Needs HAL_GetTick, so before __disable_irq() */
+    HAL_RCC_DeInit();
+
     __disable_irq();
+
+    HAL_DeInit();
+
     SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+    SCB->ICSR = SCB_ICSR_PENDSTCLR_Msk | SCB_ICSR_PENDSVCLR_Msk;
 
     for (int i = 0; i < 8; i++) {
         NVIC->ICER[i] = 0xFFFFFFFFU;
@@ -104,16 +199,21 @@ static void jump_to_app(void)
     }
 
     SCB->VTOR = APP_START_ADDR;
+    __DSB();
+    __ISB();
 
     uint32_t sp  = *(volatile uint32_t *)(APP_START_ADDR);
     uint32_t pc  = *(volatile uint32_t *)(APP_START_ADDR + 4U);
 
-    __set_MSP(sp);
-    void (*app_reset)(void) = (void (*)(void))pc;
-    app_reset();
+    /* No stack access allowed once MSP changes */
+    __asm volatile (
+        "msr msp, %0  \n"
+        "cpsie i      \n"
+        "bx  %1       \n"
+        : : "r" (sp), "r" (pc) : "memory");
+    __builtin_unreachable();
 }
 
-/* CAN filter: accept only BL_RX_ID */
 static void setup_can_filter(void)
 {
     CAN_FilterTypeDef f = {
@@ -131,40 +231,29 @@ static void setup_can_filter(void)
     HAL_CAN_ConfigFilter(s_hcan, &f);
 }
 
-/* Main bootloader entry point */
-
 void BL_Run(CAN_HandleTypeDef *hcan)
 {
     s_hcan = hcan;
+
+    int flash_requested = bl_flag_is_set();
+    int app_ok          = app_is_valid();
+
     setup_can_filter();
     HAL_CAN_Start(hcan);
 
-    /* State */
-    uint32_t write_addr   = APP_START_ADDR;
     uint32_t total_size   = 0;
-    uint32_t bytes_rx     = 0;
-    uint32_t running_crc  = 0;
+    uint32_t next_idx     = 0;
     int      flash_active = 0;
-    int      flash_unlocked = 0;
 
-    /* If the app set the RAM flag, wait indefinitely for flash.
-     * Otherwise use the short timeout and jump to app immediately after. */
-    int flash_requested = bl_flag_is_set();
-    uint32_t deadline = flash_requested ? 0xFFFFFFFFU
-                                        : HAL_GetTick() + BL_WAIT_MS;
+    int      stay   = flash_requested || !app_ok;
+    uint32_t t_boot = HAL_GetTick();
 
     CAN_RxHeaderTypeDef rx_hdr;
     uint8_t rx_data[8];
 
     while (1) {
-        if (!flash_active && HAL_GetTick() > deadline) {
-            if (app_is_valid()) {
-                if (flash_unlocked) HAL_FLASH_Lock();
-                HAL_CAN_Stop(hcan);
-                jump_to_app();
-            }
-            deadline = HAL_GetTick() + BL_WAIT_MS;
-        }
+        if (!stay && (HAL_GetTick() - t_boot) >= BL_WAIT_MS)
+            jump_to_app();
 
         if (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) == 0)
             continue;
@@ -172,86 +261,110 @@ void BL_Run(CAN_HandleTypeDef *hcan)
         if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_hdr, rx_data) != HAL_OK)
             continue;
 
+        if (rx_hdr.DLC == 0)
+            continue;
+
         uint8_t cmd = rx_data[0];
+        stay = 1;
 
         switch (cmd) {
 
         case BL_CMD_PING:
-            send_ack();
+            send_ack(cmd);
             break;
 
         case BL_CMD_START:
-            if (rx_hdr.DLC < 5) { send_nack(BL_ERR_NOSTART); break; }
-            total_size = (uint32_t)rx_data[1]
-                       | ((uint32_t)rx_data[2] << 8)
-                       | ((uint32_t)rx_data[3] << 16)
-                       | ((uint32_t)rx_data[4] << 24);
+            if (rx_hdr.DLC < 5) { send_nack(cmd, BL_ERR_DLC); break; }
+            total_size = rd_le32(&rx_data[1]);
 
-            if (total_size == 0 || total_size > APP_MAX_SIZE) {
-                send_nack(BL_ERR_SIZE);
+            if (total_size == 0 || total_size > APP_MAX_SIZE || (total_size & 3U)) {
+                send_nack(cmd, BL_ERR_SIZE);
                 break;
             }
-            if (erase_app_sectors() != HAL_OK) {
-                send_nack(BL_ERR_ERASE);
-                break;
-            }
+            app_ok       = 0;
+            flash_active = 0;
             HAL_FLASH_Unlock();
-            flash_unlocked = 1;
-            write_addr    = APP_START_ADDR;
-            bytes_rx      = 0;
-            running_crc   = 0;
-            flash_active  = 1;
-            send_ack();
+            if (erase_app_sectors(total_size) != HAL_OK) {
+                HAL_FLASH_Lock();
+                send_nack(cmd, BL_ERR_ERASE);
+                break;
+            }
+            next_idx     = 0;
+            flash_active = 1;
+            send_ack(cmd);
             break;
 
         case BL_CMD_DATA:
-            if (!flash_active) { send_nack(BL_ERR_NOSTART); break; }
-            if (rx_hdr.DLC < 5) { send_nack(BL_ERR_WRITE); break; }
+            if (!flash_active) { send_nack(cmd, BL_ERR_NOSTART); break; }
+            if (rx_hdr.DLC < 8) { send_nack(cmd, BL_ERR_DLC); break; }
 
             {
-                uint32_t word = (uint32_t)rx_data[1]
-                              | ((uint32_t)rx_data[2] << 8)
-                              | ((uint32_t)rx_data[3] << 16)
-                              | ((uint32_t)rx_data[4] << 24);
+                uint32_t idx = (uint32_t)rx_data[1]
+                             | ((uint32_t)rx_data[2] << 8)
+                             | ((uint32_t)rx_data[3] << 16);
 
-                if (flash_write_word(write_addr, word) != HAL_OK) {
-                    send_nack(BL_ERR_WRITE);
+                /* ACK lost, host resent the last word */
+                if (next_idx > 0 && idx == next_idx - 1U) {
+                    send_ack_data(idx);
                     break;
                 }
-                running_crc = crc32_update(running_crc, &rx_data[1], 4);
-                write_addr += 4;
-                bytes_rx   += 4;
+                if (idx != next_idx) {
+                    send_nack_seq(next_idx);
+                    break;
+                }
+                if ((idx + 1U) * 4U > total_size) {
+                    send_nack(cmd, BL_ERR_SIZE);
+                    break;
+                }
+                if (flash_write_word(APP_START_ADDR + idx * 4U, rd_le32(&rx_data[4])) != HAL_OK) {
+                    send_nack(cmd, BL_ERR_WRITE);
+                    break;
+                }
+                next_idx++;
+                send_ack_data(idx);
             }
-            send_ack();
             break;
 
         case BL_CMD_CRC:
-            if (!flash_active) { send_nack(BL_ERR_NOSTART); break; }
-            if (rx_hdr.DLC < 5) { send_nack(BL_ERR_CRC); break; }
+            if (rx_hdr.DLC < 5) { send_nack(cmd, BL_ERR_DLC); break; }
 
             {
-                uint32_t expected = (uint32_t)rx_data[1]
-                                  | ((uint32_t)rx_data[2] << 8)
-                                  | ((uint32_t)rx_data[3] << 16)
-                                  | ((uint32_t)rx_data[4] << 24);
+                uint32_t expected = rd_le32(&rx_data[1]);
 
-                if (running_crc != expected) {
-                    send_nack(BL_ERR_CRC);
+                if (!flash_active) {
+                    /* ACK lost, host resent CRC */
+                    const volatile bl_trailer_t *t = (const volatile bl_trailer_t *)BL_TRAILER_ADDR;
+                    if (app_ok && t->crc == expected) send_ack(cmd);
+                    else                              send_nack(cmd, BL_ERR_NOSTART);
                     break;
                 }
+                if (next_idx * 4U != total_size) {
+                    send_nack(cmd, BL_ERR_SIZE);
+                    break;
+                }
+
+                /* Read back from flash, not the received bytes */
+                flash_flush_dcache();
+                if (flash_crc(total_size) != expected) {
+                    send_nack(cmd, BL_ERR_CRC);
+                    break;
+                }
+                if (write_trailer(total_size, expected) != HAL_OK) {
+                    send_nack(cmd, BL_ERR_WRITE);
+                    break;
+                }
+                HAL_FLASH_Lock();
+                flash_flush_dcache();
+                flash_active = 0;
+                app_ok       = app_is_valid();
+                if (app_ok) send_ack(cmd);
+                else        send_nack(cmd, BL_ERR_NOJUMP);
             }
-            HAL_FLASH_Lock();
-            flash_unlocked = 0;
-            flash_active   = 0;
-            send_ack();
             break;
 
         case BL_CMD_JUMP:
-            if (!app_is_valid()) { send_nack(BL_ERR_NOJUMP); break; }
-            send_ack();
-            HAL_Delay(10);   /* let ACK transmit before cutting power to CAN */
-            if (flash_unlocked) HAL_FLASH_Lock();
-            HAL_CAN_Stop(hcan);
+            if (flash_active || !app_ok) { send_nack(cmd, BL_ERR_NOJUMP); break; }
+            send_ack(cmd);
             jump_to_app();
             break;
 

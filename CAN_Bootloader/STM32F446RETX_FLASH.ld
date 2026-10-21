@@ -44,7 +44,9 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 /* Memories definition */
 MEMORY
 {
-  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
+  RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K - 16
+  /* Boot request flag (BL_FLAG_ADDR), kept out of the stack */
+  NOINIT (rw)     : ORIGIN = 0x2001FFF0,   LENGTH = 16
   FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 16K   /* sector 0 only — app starts at 0x08004000 */
 }
 
